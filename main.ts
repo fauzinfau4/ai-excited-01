@@ -63,6 +63,19 @@ function validatePng(bytes: Buffer): { width: number; height: number } {
   if (width > MAX_WIDTH || height > MAX_HEIGHT) {
     fail(`dimensions ${width}x${height} exceed the ${MAX_WIDTH}x${MAX_HEIGHT} limit`);
   }
+  // IHDR data continues with bit depth (byte 24) and color type
+  // (byte 25). Only the values the PNG spec allows are sane here:
+  // bit depth 1, 2, 4, 8 or 16, color type 0 (grey), 2 (RGB),
+  // 3 (palette), 4 (grey+alpha) or 6 (RGBA). Anything else means the
+  // header is garbled, so fail loudly instead of shipping it.
+  const bitDepth = bytes[24];
+  const colorType = bytes[25];
+  if (![1, 2, 4, 8, 16].includes(bitDepth)) {
+    fail(`invalid IHDR bit depth ${bitDepth} (must be 1, 2, 4, 8 or 16)`);
+  }
+  if (![0, 2, 3, 4, 6].includes(colorType)) {
+    fail(`invalid IHDR color type ${colorType} (must be 0, 2, 3, 4 or 6)`);
+  }
   // The gate needs a whole image: walk every chunk, check each checksum,
   // and make sure the file ends exactly on its IEND chunk.
   checkChunksWhole(bytes);
@@ -136,5 +149,17 @@ writeFileSync(target, bytes);
 const written = readFileSync(target);
 if (!written.equals(bytes)) {
   fail(`output ${target} does not match the source after writing`);
+}
+// Verify the written copy itself, not just that it matches the source
+// in memory: run the same full validation — magic bytes, size and
+// dimension limits, and the whole chunk-CRC walk — on the OUTPUT bytes
+// just read back from disk, so a torn or corrupt write fails loudly
+// instead of silently shipping a bad entry.
+const outCheck = validatePng(written);
+if (outCheck.width !== width || outCheck.height !== height) {
+  fail(
+    `output dimensions ${outCheck.width}x${outCheck.height} differ from ` +
+      `source ${width}x${height}`,
+  );
 }
 console.log(`wrote ${target}: PNG ${width}x${height}, ${bytes.length} bytes`);
