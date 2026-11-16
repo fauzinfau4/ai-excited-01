@@ -1,246 +1,148 @@
-import { deflateSync, inflateSync } from 'node:zlib';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
-
-const W = 1024, H = 1024;
-type Color = [number, number, number, number];
-const pixels = new Uint8Array(W * H * 4);
-
-function seeded(seed: number) {
-  let x = seed >>> 0;
-  return () => {
-    x = (x + 0x6d2b79f5) >>> 0;
-    let z = x;
-    z = Math.imul(z ^ (z >>> 15), z | 1);
-    z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
-    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const random = seeded(0x4b4f4937);
-const clamp = (v: number, lo = 0, hi = 255) => Math.max(lo, Math.min(hi, Math.round(v)));
-
-function blend(x: number, y: number, color: Color) {
-  x = Math.round(x); y = Math.round(y);
-  if (x < 0 || y < 0 || x >= W || y >= H) return;
-  const i = (y * W + x) * 4, a = color[3] / 255, q = 1 - a;
-  pixels[i] = clamp(color[0] * a + pixels[i] * q);
-  pixels[i + 1] = clamp(color[1] * a + pixels[i + 1] * q);
-  pixels[i + 2] = clamp(color[2] * a + pixels[i + 2] * q);
-  pixels[i + 3] = 255;
-}
-function box(x0: number, y0: number, x1: number, y1: number, color: Color) {
-  const ax = Math.max(0, Math.floor(x0)), bx = Math.min(W - 1, Math.ceil(x1));
-  const ay = Math.max(0, Math.floor(y0)), by = Math.min(H - 1, Math.ceil(y1));
-  for (let y = ay; y <= by; y++) for (let x = ax; x <= bx; x++) blend(x, y, color);
-}
-function disk(cx: number, cy: number, radius: number, color: Color) {
-  const r2 = radius * radius;
-  for (let y = Math.floor(cy - radius); y <= Math.ceil(cy + radius); y++)
-    for (let x = Math.floor(cx - radius); x <= Math.ceil(cx + radius); x++)
-      if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) blend(x, y, color);
-}
-function ellipse(cx: number, cy: number, rx: number, ry: number, color: Color) {
-  const r2 = Math.max(rx, ry), ax = Math.floor(cx - rx), bx = Math.ceil(cx + rx);
-  for (let y = Math.floor(cy - ry); y <= Math.ceil(cy + ry); y++)
-    for (let x = ax; x <= bx; x++) if (((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1) blend(x, y, color);
-}
-function line(x0: number, y0: number, x1: number, y1: number, width: number, color: Color) {
-  const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0) * 1.4);
-  for (let i = 0; i <= steps; i++) {
-    const t = steps ? i / steps : 0;
-    disk(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, width / 2, color);
-  }
-}
-function polygon(points: number[][], color: Color) {
-  const ys = points.map(p => p[1]), y0 = Math.max(0, Math.floor(Math.min(...ys))), y1 = Math.min(H - 1, Math.ceil(Math.max(...ys)));
-  for (let y = y0; y <= y1; y++) {
-    const hits: number[] = [];
-    for (let i = 0; i < points.length; i++) {
-      const [x1, yy1] = points[i], [x2, yy2] = points[(i + 1) % points.length];
-      if ((yy1 <= y && yy2 > y) || (yy2 <= y && yy1 > y)) hits.push(x1 + (y - yy1) * (x2 - x1) / (yy2 - yy1));
-    }
-    hits.sort((a, b) => a - b);
-    for (let i = 0; i + 1 < hits.length; i += 2) box(hits[i], y, hits[i + 1], y, color);
-  }
-}
-
-const crcTable = new Uint32Array(256);
-for (let n = 0; n < 256; n++) {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  crcTable[n] = c >>> 0;
-}
-function crc32(bytes: Uint8Array) {
-  let c = 0xffffffff;
-  for (const b of bytes) c = crcTable[(c ^ b) & 255] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-function u32(n: number) { const b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0); return b; }
-function chunk(type: string, data: Uint8Array) {
-  const t = Buffer.from(type), body = Buffer.concat([t, Buffer.from(data)]);
-  return Buffer.concat([u32(data.length), body, u32(crc32(body))]);
-}
-function encodePng() {
-  const raw = Buffer.alloc(H * (W * 4 + 1));
-  for (let y = 0; y < H; y++) raw.set(pixels.subarray(y * W * 4, (y + 1) * W * 4), y * (W * 4 + 1) + 1);
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(W, 0); ihdr.writeUInt32BE(H, 4); ihdr[8] = 8; ihdr[9] = 6;
-  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw, { level: 9 })), chunk('IEND', Buffer.alloc(0))]);
-}
-function validatePng(bytes: Buffer) {
-  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  if (!bytes.subarray(0, 8).equals(signature)) throw new Error('bad PNG signature');
-  let offset = 8, width = 0, height = 0, ended = false;
-  const compressed: Buffer[] = [];
-  while (offset + 12 <= bytes.length) {
-    const size = bytes.readUInt32BE(offset), end = offset + 12 + size;
-    if (end > bytes.length) throw new Error('truncated PNG chunk');
-    const type = bytes.toString('ascii', offset + 4, offset + 8), data = bytes.subarray(offset + 8, offset + 8 + size);
-    const checked = bytes.subarray(offset + 4, offset + 8 + size);
-    if (crc32(checked) !== bytes.readUInt32BE(offset + 8 + size)) throw new Error(`bad ${type} CRC`);
-    if (type === 'IHDR') { width = data.readUInt32BE(0); height = data.readUInt32BE(4); }
-    if (type === 'IDAT') compressed.push(data);
-    if (type === 'IEND') { ended = true; offset = end; break; }
-    offset = end;
-  }
-  if (!ended || offset !== bytes.length) throw new Error('missing IEND or trailing PNG data');
-  if (width !== W || height !== H || width > 1024 || height > 1024) throw new Error(`unexpected dimensions ${width}x${height}`);
-  const decoded = inflateSync(Buffer.concat(compressed));
-  if (decoded.length !== H * (W * 4 + 1)) throw new Error('unexpected decoded pixel data length');
-  if (bytes.length > 1048576) throw new Error(`PNG is over 1 MiB: ${bytes.length}`);
-}
-
-// Scene: a koi leaps from a porcelain cup into a spiralling, star-bright tea sky.
-const C = {
-  ink: [15, 24, 48, 255] as Color, night: [7, 15, 39, 255] as Color,
-  deep: [10, 34, 66, 255] as Color, teal: [21, 125, 143, 255] as Color,
-  aqua: [90, 226, 210, 255] as Color, cream: [255, 239, 205, 255] as Color,
-  porcelain: [249, 244, 226, 255] as Color, coral: [238, 89, 70, 255] as Color,
-  orange: [255, 155, 73, 255] as Color, gold: [255, 211, 102, 255] as Color,
-  white: [255, 255, 247, 255] as Color, shadow: [4, 12, 30, 255] as Color,
+'use strict';
+// Teacup Koi: a koi rockets out of a porcelain cup as tea becomes a celestial tide.
+// Every shape, color, and pixel is produced here; fixed geometry keeps the PNG reproducible.
+const fs = require('node:fs');
+const path = require('node:path');
+const zlib = require('node:zlib');
+const N = 1024;
+const pixels = Buffer.alloc(N * N * 4);
+const palette = {
+  night: '#071629', deep: '#0b3148', teal: '#147887', aqua: '#62d4c1', pale: '#d9fff0',
+  porcelain: '#fff3d3', gold: '#ffbd56', orange: '#fa7548', red: '#dd4550', ink: '#102b3c',
+  foam: '#f9fff4', jade: '#268c82', shadow: '#b4cec0'
 };
-box(0, 0, W - 1, H - 1, C.night);
-// Quiet framing bands give the central splash a strong silhouette at thumbnail scale.
-ellipse(510, 456, 438, 438, [12, 38, 67, 255]);
-ellipse(510, 456, 410, 410, [18, 56, 79, 255]);
-ellipse(510, 456, 385, 385, [12, 35, 65, 255]);
-ellipse(510, 456, 358, 358, [20, 68, 87, 255]);
-// Radiating tea-current ribbons, swept toward the leap.
-for (let i = 0; i < 9; i++) {
-  const a = -2.65 + i * 0.39;
-  const x1 = 510 + Math.cos(a) * 402, y1 = 452 + Math.sin(a) * 402;
-  const x2 = 526 + Math.cos(a + 0.55) * (258 + (i % 3) * 17), y2 = 438 + Math.sin(a + 0.55) * (258 + (i % 3) * 17);
-  line(x1, y1, x2, y2, 4 + (i % 3), i % 2 ? [70, 184, 175, 145] : [255, 190, 89, 160]);
+function color(hex) { return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); }
+function put(x, y, hex) {
+  x = Math.round(x); y = Math.round(y);
+  if (x < 0 || y < 0 || x >= N || y >= N) return;
+  const [r, g, b] = color(hex), p = (y * N + x) * 4;
+  pixels[p] = r; pixels[p + 1] = g; pixels[p + 2] = b; pixels[p + 3] = 255;
 }
-// A thin, luminous halo behind the cup.
-for (let i = 0; i < 72; i++) {
-  const a = i * Math.PI * 2 / 72;
-  const r = i % 3 === 0 ? 343 : 331;
-  disk(510 + Math.cos(a) * r, 463 + Math.sin(a) * r, i % 3 === 0 ? 3 : 1.5, i % 3 === 0 ? C.gold : C.aqua);
+function disk(cx, cy, radius, hex) {
+  const r2 = radius * radius;
+  for (let y = Math.max(0, Math.floor(cy - radius)); y <= Math.min(N - 1, Math.ceil(cy + radius)); y++)
+    for (let x = Math.max(0, Math.floor(cx - radius)); x <= Math.min(N - 1, Math.ceil(cx + radius)); x++)
+      if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) put(x, y, hex);
 }
-// Floating tea pearls and four-point glints.
-function sparkle(x: number, y: number, size: number, color: Color) {
-  polygon([[x, y - size], [x + size * .24, y - size * .24], [x + size, y], [x + size * .24, y + size * .24], [x, y + size], [x - size * .24, y + size * .24], [x - size, y], [x - size * .24, y - size * .24]], color);
-}
-for (let i = 0; i < 55; i++) {
-  const a = random() * Math.PI * 2, r = 210 + random() * 285;
-  const x = 510 + Math.cos(a) * r, y = 450 + Math.sin(a) * r;
-  if (i % 4 === 0) sparkle(x, y, 5 + random() * 7, i % 8 ? C.gold : C.white);
-  else disk(x, y, 1.5 + random() * 3.2, i % 3 ? C.aqua : C.orange);
-}
-// Cup shadow, curved saucer, handle, and the body of the cup.
-ellipse(513, 817, 302, 54, [3, 10, 26, 255]);
-ellipse(514, 795, 300, 52, C.gold);
-ellipse(514, 783, 280, 43, C.porcelain);
-ellipse(514, 776, 239, 26, [228, 220, 197, 255]);
-// Handle appears behind the cup; the hollow is cut by overpainting the background tone.
-ellipse(781, 675, 107, 147, C.gold);
-ellipse(781, 675, 78, 115, [15, 44, 70, 255]);
-ellipse(779, 670, 63, 97, [12, 37, 65, 255]);
-polygon([[266, 485], [765, 485], [704, 775], [661, 822], [368, 822], [326, 778]], C.porcelain);
-polygon([[266, 485], [297, 494], [352, 752], [382, 797], [672, 797], [704, 775], [661, 822], [368, 822], [326, 778]], [212, 219, 210, 255]);
-// Porcelain highlights and a fine cobalt rim.
-line(286, 507, 747, 507, 12, C.teal);
-line(299, 516, 733, 516, 3, C.aqua);
-line(357, 744, 387, 788, 5, C.white);
-line(680, 769, 659, 789, 4, C.white);
-// Tea surface is an ellipse nestled inside the lip.
-ellipse(514, 494, 223, 37, [8, 75, 90, 255]);
-ellipse(514, 489, 199, 25, [24, 128, 130, 255]);
-for (let i = 0; i < 30; i++) {
-  const x = 335 + random() * 358, y = 476 + random() * 27;
-  disk(x, y, 1 + random() * 2.4, i % 4 ? C.gold : C.white);
-}
-// The koi's sweeping body is a sequence of overlapping, tapered fish forms.
-// Its tail fans upward left; its head breaks into the upper right in a burst of foam.
-polygon([[351, 452], [287, 414], [251, 345], [280, 357], [308, 322], [323, 378], [391, 397]], C.coral);
-polygon([[345, 447], [292, 410], [267, 364], [303, 389], [319, 359], [329, 411], [388, 422]], C.orange);
-// Main arcing torso, broad through the center and narrow at the tail.
-polygon([[315, 427], [367, 383], [446, 355], [527, 345], [592, 361], [655, 399], [705, 441], [725, 474], [691, 496], [637, 505], [575, 495], [505, 473], [434, 455], [374, 450]], C.white);
-polygon([[329, 421], [381, 394], [447, 370], [520, 361], [577, 374], [631, 405], [674, 442], [690, 462], [653, 478], [601, 474], [542, 455], [480, 436], [420, 426], [369, 440]], [249, 231, 205, 255]);
-// Koi vermilion islands, shaped as deliberate patches across the back.
-polygon([[394, 392], [433, 367], [469, 364], [493, 379], [485, 403], [454, 414], [421, 414], [392, 426], [371, 414]], C.coral);
-polygon([[514, 364], [551, 364], [587, 382], [601, 402], [581, 420], [547, 412], [524, 395]], C.orange);
-polygon([[624, 407], [655, 426], [682, 451], [673, 469], [640, 462], [615, 444]], C.coral);
-polygon([[328, 422], [353, 405], [378, 411], [389, 434], [368, 450], [340, 445]], C.orange);
-// Side fins, outlined in warm gold.
-polygon([[451, 437], [420, 486], [450, 477], [489, 448]], C.gold);
-polygon([[459, 441], [432, 477], [456, 469], [482, 447]], [255, 248, 220, 255]);
-polygon([[593, 448], [613, 496], [627, 478], [618, 438]], C.gold);
-polygon([[600, 449], [616, 482], [620, 459]], [255, 248, 220, 255]);
-// Fin rays.
-for (let i = 0; i < 6; i++) line(438 + i * 5, 471 - i * 2, 451 + i * 6, 444 + i * 2, 2, [204, 117, 69, 255]);
-// Head, cheek, gill and alert eye.
-ellipse(697, 450, 58, 47, C.white);
-polygon([[663, 421], [692, 400], [717, 405], [739, 426], [730, 447], [708, 452], [685, 438]], C.coral);
-ellipse(714, 464, 24, 17, [255, 216, 185, 255]);
-line(674, 437, 664, 464, 4, [166, 90, 78, 255]);
-disk(712, 433, 10, C.ink); disk(715, 430, 3, C.white);
-// Open, delighted fish mouth and whisker-like barbels.
-ellipse(749, 470, 11, 7, C.ink);
-line(742, 475, 769, 493, 3, C.cream);
-line(739, 458, 770, 451, 2, C.cream);
-// Scales: arcing rows of tiny mother-of-pearl crescents.
-for (let row = 0; row < 4; row++) for (let col = 0; col < 9; col++) {
-  const x = 424 + col * 25 + (row % 2) * 12, y = 420 + row * 12 - Math.abs(col - 4) * 1.7;
-  if (x < 650 && random() > .18) {
-    line(x - 5, y, x, y + 5, 1.5, [255, 255, 239, 220]);
-    line(x, y + 5, x + 6, y, 1.5, [114, 184, 175, 210]);
+function oval(cx, cy, rx, ry, hex) {
+  for (let y = Math.max(0, Math.floor(cy - ry)); y <= Math.min(N - 1, Math.ceil(cy + ry)); y++) {
+    const q = 1 - ((y - cy) / ry) ** 2;
+    if (q < 0) continue;
+    const dx = rx * Math.sqrt(q);
+    for (let x = Math.max(0, Math.floor(cx - dx)); x <= Math.min(N - 1, Math.ceil(cx + dx)); x++) put(x, y, hex);
   }
 }
-// Splash crown arcs around the koi, using beads and swept brush strokes.
-const splash = [[315, 481], [286, 451], [277, 422], [260, 432], [251, 401], [234, 390], [242, 427], [225, 418], [239, 457], [270, 473]];
-for (let i = 0; i + 1 < splash.length; i++) line(splash[i][0], splash[i][1], splash[i + 1][0], splash[i + 1][1], 9, i % 2 ? C.aqua : C.white);
-for (let i = 0; i < 25; i++) {
-  const x = 232 + random() * 555, y = 338 + random() * 169;
-  const dx = (x - 490) * .07, dy = (y - 420) * .05;
-  if (random() > .48) disk(x + dx, y + dy, 2 + random() * 5, i % 3 ? C.aqua : C.white);
+function poly(points, hex) {
+  const ymin = Math.max(0, Math.floor(Math.min(...points.map(p => p[1]))));
+  const ymax = Math.min(N - 1, Math.ceil(Math.max(...points.map(p => p[1]))));
+  for (let y = ymin; y <= ymax; y++) {
+    const cuts = [];
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+      const [x1, y1] = points[j], [x2, y2] = points[i];
+      if ((y1 <= y && y2 > y) || (y2 <= y && y1 > y)) cuts.push(x1 + (y - y1) * (x2 - x1) / (y2 - y1));
+    }
+    cuts.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < cuts.length; k += 2)
+      for (let x = Math.max(0, Math.ceil(cuts[k])); x <= Math.min(N - 1, Math.floor(cuts[k + 1])); x++) put(x, y, hex);
+  }
 }
-// A sweeping crescent and suspended droplets carry the leap without crossing the fish.
-line(289, 514, 249, 481, 5, C.aqua);
-line(249, 481, 220, 441, 4, C.white);
-line(220, 441, 211, 410, 3, C.gold);
-line(722, 510, 775, 490, 5, C.aqua);
-line(775, 490, 812, 456, 4, C.white);
-line(812, 456, 827, 424, 3, C.gold);
-for (let i = 0; i < 18; i++) {
-  const side = i % 2 ? 1 : -1;
-  const x = side < 0 ? 216 + random() * 55 : 777 + random() * 62;
-  const y = 394 + random() * 126;
-  disk(x, y, 2.5 + random() * 5, i % 3 ? C.aqua : C.white);
-  if (i % 4 === 0) sparkle(x + side * 6, y - 8, 4 + random() * 3, C.gold);
+function line(a, b, width, hex) {
+  const steps = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1])));
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps; disk(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, width / 2, hex);
+  }
 }
-// Tiny cup medallion: the single punctuation mark at the base.
-disk(514, 686, 31, C.teal); disk(514, 686, 25, C.porcelain);
-sparkle(514, 686, 18, C.coral);
-const target = resolve(process.env.MAKEFUN_OUTPUT_DIR || '.', 'entry.png');
-mkdirSync(dirname(target), { recursive: true });
-const png = encodePng();
-validatePng(png);
-writeFileSync(target, png);
-if (process.argv.includes('--check')) {
-  const saved = readFileSync(target);
-  validatePng(saved);
-  console.log(`PNG OK ${W}x${H} ${saved.length} bytes sha256=${createHash('sha256').update(saved).digest('hex')}`);
+function bezier(a, b, c, d, width, hex) {
+  let prev = a;
+  for (let i = 1; i <= 96; i++) {
+    const t = i / 96, u = 1 - t;
+    const next = [u ** 3 * a[0] + 3 * u * u * t * b[0] + 3 * u * t * t * c[0] + t ** 3 * d[0],
+      u ** 3 * a[1] + 3 * u * u * t * b[1] + 3 * u * t * t * c[1] + t ** 3 * d[1]];
+    line(prev, next, width, hex); prev = next;
+  }
 }
+function sparkle(x, y, r, hex) {
+  poly([[x,y-r],[x+r*.17,y-r*.17],[x+r,y],[x+r*.17,y+r*.17],[x,y+r],[x-r*.17,y+r*.17],[x-r,y],[x-r*.17,y-r*.17]], hex);
+}
+// Layered midnight gradient with a restrained halo behind the leap.
+for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+  const glow = Math.max(0, 1 - Math.hypot((x - 520) / 720, (y - 365) / 680));
+  const grain = ((x * 13 + y * 29) % 47 === 0) ? 1 : 0, p = (y * N + x) * 4;
+  pixels[p] = 6 + Math.round(glow * 8) + grain;
+  pixels[p + 1] = 19 + Math.round(glow * 36) + grain;
+  pixels[p + 2] = 39 + Math.round(glow * 47) + grain; pixels[p + 3] = 255;
+}
+// A gold moon and a broad, directional spiral make the splash feel like a portal.
+disk(792, 179, 123, palette.deep); disk(792, 179, 98, palette.gold); disk(792, 179, 84, '#145365');
+oval(762, 151, 25, 10, palette.teal); oval(823, 207, 19, 8, palette.teal);
+bezier([85,668],[123,354],[331,215],[532,302],38,'#0a536b');
+bezier([82,654],[149,370],[329,258],[527,318],9,palette.aqua);
+bezier([947,644],[878,393],[707,303],[552,363],31,'#0c5267');
+bezier([940,668],[852,431],[696,355],[554,391],8,palette.pale);
+bezier([185,824],[411,892],[674,805],[819,595],23,'#0c4c62');
+bezier([217,812],[432,864],[657,786],[794,617],6,palette.aqua);
+// A thin, broken halo gives the central leap a second scale cue.
+bezier([373,307],[440,240],[576,230],[661,288],3,'#67a9a2');
+bezier([675,304],[697,325],[710,342],[718,356],2,palette.gold);
+// Tea shoots up from the cup in tapered arcs and bright, separated droplets.
+for (let i = 0; i < 9; i++) {
+  const x = 354 + i * 39, top = 372 + Math.abs(i - 4) * 17;
+  bezier([x + 5, 690],[x - 46, 560],[x + 42, 486],[x, top],5 + (i % 3),i % 2 ? palette.teal : palette.jade);
+}
+const droplets = [[303,426,8],[347,361,5],[395,331,7],[451,287,5],[483,389,9],[527,351,5],[591,327,7],[637,383,6],[686,427,8],[733,465,5],[285,525,6],[789,508,8],[343,574,4],[682,555,5],[592,477,4],[423,451,5],[747,338,4],[253,474,5],[855,392,6],[623,605,4],[310,632,5],[490,529,7],[833,575,4],[205,579,4]];
+for (let i = 0; i < droplets.length; i++) {
+  const [x,y,r] = droplets[i], hue = i % 5 === 0 ? palette.red : i % 3 === 0 ? palette.pale : palette.gold;
+  disk(x, y, r, hue); disk(x - r * .23, y - r * .3, Math.max(1, r * .22), palette.foam);
+}
+// The koi's tail and fins flare backward while its head breaks toward the moon.
+poly([[422,487],[365,416],[318,375],[388,390],[466,438],[510,463]],palette.ink);
+poly([[427,501],[372,559],[344,625],[408,588],[474,536],[514,510]],palette.ink);
+poly([[430,477],[389,411],[395,347],[446,396],[489,447],[520,466]],palette.orange);
+poly([[437,502],[392,548],[371,600],[428,563],[482,526],[520,509]],palette.red);
+oval(558,449,151,68,palette.ink); oval(559,440,140,58,palette.porcelain);
+oval(560,440,123,48,palette.gold); oval(548,446,83,34,palette.orange);
+poly([[457,410],[488,384],[528,389],[551,408],[533,427],[492,432],[466,423]],palette.porcelain);
+poly([[573,481],[621,477],[659,450],[687,431],[674,475],[644,500],[605,498]],palette.porcelain);
+poly([[643,411],[682,365],[743,348],[807,369],[789,405],[742,432],[690,439]],palette.ink);
+poly([[650,404],[688,372],[746,361],[781,378],[755,399],[710,416],[672,423]],palette.red);
+poly([[681,407],[714,394],[757,384],[778,389],[757,412],[715,427],[689,424]],palette.porcelain);
+bezier([675,402],[688,390],[699,389],[710,396],5,palette.red);
+disk(741,382,10,palette.ink); disk(744,379,3,palette.foam); disk(779,390,3,palette.ink);
+bezier([787,397],[798,404],[807,402],[812,394],3,palette.porcelain);
+bezier([784,405],[798,416],[807,414],[813,408],2,palette.porcelain);
+poly([[533,477],[560,511],[609,523],[589,493],[571,466]],palette.red);
+for (let i = 0; i < 6; i++) line([545 + i * 7,472],[578 + i * 6,501],2,palette.gold);
+for (let i = 0; i < 6; i++) bezier([500 + i * 19,424],[508 + i * 19,408],[517 + i * 19,411],[523 + i * 19,426],2,palette.orange);
+// The cup anchors the motion: dark foot, luminous tea rim, ivory body, cobalt wave.
+oval(508,779,297,70,palette.ink); oval(508,764,284,60,palette.gold); oval(508,750,263,47,palette.porcelain); oval(508,749,220,30,'#104b5b');
+poly([[230,766],[786,766],[728,944],[669,990],[353,990],[291,948]],palette.ink);
+poly([[250,774],[765,774],[714,929],[660,971],[365,971],[309,930]],palette.porcelain);
+poly([[274,797],[741,797],[695,915],[648,950],[376,950],[328,915]],palette.shadow);
+poly([[295,800],[720,800],[679,899],[633,931],[390,931],[344,899]],'#ffe8b8');
+for (let i = 0; i < 3; i++) bezier([337 + i * 115,868],[385 + i * 115,820],[425 + i * 115,912],[469 + i * 115,866],10,'#126b79');
+bezier([751,823],[862,780],[880,881],[787,905],27,palette.gold);
+bezier([754,825],[837,799],[856,867],[788,885],14,palette.porcelain);
+bezier([376,951],[466,984],[609,984],[677,949],5,palette.foam);
+bezier([251,762],[383,724],[633,724],[765,762],5,palette.foam);
+line([309,822],[326,874],3,palette.foam); line([704,822],[686,874],3,palette.foam);
+// Small rays and crisp stars add scale without competing with the koi silhouette.
+for (const [a,b,w] of [[[174,383],[242,351],5],[[834,405],[898,369],4],[[248,538],[322,508],3],[[771,518],[844,482],4],[[433,257],[474,217],3],[[165,706],[226,692],3]]) line(a,b,w,palette.aqua);
+for (const [x,y,r,h] of [[220,265,14,palette.foam],[869,293,9,palette.foam],[191,493,7,palette.gold],[866,530,12,palette.foam],[709,581,8,palette.aqua],[285,684,9,palette.gold],[651,244,7,palette.foam],[910,225,6,palette.aqua]]) disk(x,y,r,h);
+sparkle(260,195,19,palette.foam); sparkle(884,438,14,palette.gold); sparkle(697,551,11,palette.aqua); sparkle(351,329,9,palette.porcelain); sparkle(822,584,8,palette.foam);
+// Build canonical PNG chunks with fixed compression and CRCs.
+const crcTable = new Uint32Array(256);
+for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >>> 1) : c >>> 1; crcTable[n] = c >>> 0; }
+function crc32(bytes) { let c = 0xffffffff; for (const b of bytes) c = crcTable[(c ^ b) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+function chunk(type, data) {
+  const label = Buffer.from(type), length = Buffer.alloc(4), checksum = Buffer.alloc(4);
+  length.writeUInt32BE(data.length); checksum.writeUInt32BE(crc32(Buffer.concat([label, data])));
+  return Buffer.concat([length, label, data, checksum]);
+}
+const raw = Buffer.alloc((N * 4 + 1) * N);
+for (let y = 0; y < N; y++) { const row = y * (N * 4 + 1); raw[row] = 0; pixels.copy(raw, row + 1, y * N * 4, (y + 1) * N * 4); }
+const header = Buffer.alloc(13); header.writeUInt32BE(N, 0); header.writeUInt32BE(N, 4); header[8] = 8; header[9] = 6;
+const png = Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), chunk('IHDR', header), chunk('IDAT', zlib.deflateSync(raw, { level: 9 })), chunk('IEND', Buffer.alloc(0))]);
+if (png.length > 1048576) throw new Error('Image exceeds the competition size limit');
+const output = process.argv[2] || process.env.MAKEFUN_OUTPUT_DIR || '/output';
+fs.mkdirSync(output, { recursive: true });
+fs.writeFileSync(path.join(output, 'entry.png'), png);
