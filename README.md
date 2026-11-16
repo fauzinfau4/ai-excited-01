@@ -50,6 +50,6 @@ produce byte-identical output.
 ## Validation
 
 - `mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts` — runs cleanly.
-- Output `out/entry.png`: valid PNG, **960 × 640 px**, **995,942 bytes**
+- Output `out/entry.png`: valid PNG, **960 × 640 px**, **1,040,023 bytes**
   (limit: 1024 × 1024 px, 1,048,576 bytes) — passes the gate on both.
 - Re-running `main.ts` produces the identical file (byte-for-byte copy).
